@@ -17,6 +17,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cfloat>
 #define _USE_MATH_DEFINES
 #include <cmath>
@@ -143,6 +144,13 @@ static void whisper_log_callback_default(ggml_log_level level, const char * text
 
 // temperature below which we condition on past text history
 static constexpr float WHISPER_HISTORY_CONDITIONING_TEMP_CUTOFF = 0.5f;
+static constexpr int   WHISPER_CONTEXT_GAP_DISABLE = -1;
+static constexpr int   WHISPER_REPEAT_MIN_COUNT = 3;
+static constexpr int64_t WHISPER_REPEAT_MIN_DURATION_CS = 400;
+static constexpr size_t WHISPER_REPEAT_MIN_PATTERN_CHARS = 8;
+static constexpr size_t WHISPER_REPEAT_MIN_TEXT_CHARS = 24;
+static constexpr size_t WHISPER_REPEAT_RECENT_TEXT_CHARS = 256;
+static constexpr int   WHISPER_REPEAT_RECENT_SEGMENTS = 6;
 
 #define WHISPER_MAX_NODES 4096
 
@@ -467,6 +475,17 @@ struct whisper_segment {
     std::vector<whisper_token_data> tokens;
 
     bool speaker_turn_next;
+};
+
+struct whisper_chunk_candidate {
+    int seek_delta = 0;
+    bool is_no_speech = false;
+    bool single_timestamp_ending = false;
+
+    std::vector<whisper_token> prompt_past1_next;
+    std::vector<whisper_segment> segments;
+
+    std::string text;
 };
 
 struct whisper_batch {
@@ -831,6 +850,8 @@ struct vad_time_mapping {
     int64_t original_time;   // Corresponding time in original audio
 };
 
+static int64_t map_processed_to_original_time(int64_t processed_time, const std::vector<vad_time_mapping> & mapping_table);
+
 struct whisper_state {
     int64_t t_sample_us = 0;
     int64_t t_encode_us = 0;
@@ -933,6 +954,322 @@ struct whisper_state {
 
     std::vector<vad_time_mapping> vad_mapping_table;
 };
+
+static std::string whisper_normalize_repeat_text(const std::string & text) {
+    std::string normalized;
+    normalized.reserve(text.size());
+
+    bool pending_space = false;
+    for (unsigned char ch : text) {
+        if (std::isspace(ch)) {
+            pending_space = !normalized.empty();
+            continue;
+        }
+
+        if (pending_space && !normalized.empty()) {
+            normalized.push_back(' ');
+        }
+
+        normalized.push_back((char) ch);
+        pending_space = false;
+    }
+
+    return normalized;
+}
+
+static std::string whisper_collect_recent_text_tail(const std::vector<whisper_segment> & result_all) {
+    std::string recent_tail;
+    int segments_taken = 0;
+
+    for (int i = (int) result_all.size() - 1;
+         i >= 0 && segments_taken < WHISPER_REPEAT_RECENT_SEGMENTS && recent_tail.size() < WHISPER_REPEAT_RECENT_TEXT_CHARS;
+         --i, ++segments_taken) {
+        recent_tail.insert(0, result_all[i].text);
+    }
+
+    if (recent_tail.size() > WHISPER_REPEAT_RECENT_TEXT_CHARS) {
+        recent_tail.erase(0, recent_tail.size() - WHISPER_REPEAT_RECENT_TEXT_CHARS);
+    }
+
+    return recent_tail;
+}
+
+static bool whisper_has_repeated_suffix(const std::string & text) {
+    if (text.size() < WHISPER_REPEAT_MIN_TEXT_CHARS) {
+        return false;
+    }
+
+    const size_t max_pattern_len = std::min<size_t>(96, text.size()/WHISPER_REPEAT_MIN_COUNT);
+    if (max_pattern_len < WHISPER_REPEAT_MIN_PATTERN_CHARS) {
+        return false;
+    }
+
+    for (size_t pattern_len = max_pattern_len; pattern_len >= WHISPER_REPEAT_MIN_PATTERN_CHARS; --pattern_len) {
+        const size_t suffix_start = text.size() - pattern_len;
+
+        int repeat_count = 1;
+        size_t cursor = suffix_start;
+        while (cursor >= pattern_len) {
+            if (text.compare(cursor - pattern_len, pattern_len, text, suffix_start, pattern_len) != 0) {
+                break;
+            }
+
+            ++repeat_count;
+            cursor -= pattern_len;
+        }
+
+        if (repeat_count >= WHISPER_REPEAT_MIN_COUNT) {
+            return true;
+        }
+
+        if (pattern_len == WHISPER_REPEAT_MIN_PATTERN_CHARS) {
+            break;
+        }
+    }
+
+    return false;
+}
+
+static int whisper_find_vad_segment_index_for_seek(const whisper_state & state, int64_t seek) {
+    if (!state.has_vad_segments || state.vad_segments.empty() || state.vad_mapping_table.empty()) {
+        return -1;
+    }
+
+    const int64_t original_seek = map_processed_to_original_time(seek, state.vad_mapping_table);
+    auto it = std::lower_bound(
+            state.vad_segments.begin(),
+            state.vad_segments.end(),
+            original_seek,
+            [](const whisper_state::vad_segment_info & segment, int64_t time) {
+                return segment.orig_end < time;
+            });
+
+    if (it == state.vad_segments.end()) {
+        return (int) state.vad_segments.size() - 1;
+    }
+
+    return std::distance(state.vad_segments.begin(), it);
+}
+
+static bool whisper_allow_dynamic_context(
+        const whisper_state & state,
+        const whisper_full_params & params,
+        int seek,
+        int64_t * gap_ms = nullptr,
+        int * segment_index = nullptr) {
+    if (gap_ms) {
+        *gap_ms = -1;
+    }
+    if (segment_index) {
+        *segment_index = -1;
+    }
+
+    if (!params.vad || params.context_max_vad_gap_ms < 0) {
+        return true;
+    }
+
+    const int current_segment = whisper_find_vad_segment_index_for_seek(state, seek);
+    if (segment_index) {
+        *segment_index = current_segment;
+    }
+
+    if (current_segment <= 0) {
+        return true;
+    }
+
+    const auto & previous = state.vad_segments[current_segment - 1];
+    const auto & current  = state.vad_segments[current_segment];
+    const int64_t gap_cs = std::max<int64_t>(0, current.orig_start - previous.orig_end);
+    const int64_t gap_ms_local = gap_cs*10;
+
+    if (gap_ms) {
+        *gap_ms = gap_ms_local;
+    }
+
+    if (params.context_max_vad_gap_ms == 0) {
+        return false;
+    }
+
+    return gap_ms_local <= params.context_max_vad_gap_ms;
+}
+
+static bool whisper_detect_repeat_in_candidate(
+        const whisper_state & state,
+        const whisper_chunk_candidate & candidate,
+        std::string * reason = nullptr) {
+    if (reason) {
+        reason->clear();
+    }
+
+    if (candidate.is_no_speech || candidate.segments.empty()) {
+        return false;
+    }
+
+    const int64_t chunk_duration = candidate.segments.back().t1 - candidate.segments.front().t0;
+
+    std::string previous_segment_text;
+    int repeated_segment_count = 0;
+    int64_t repeated_segment_duration = 0;
+
+    for (const auto & segment : candidate.segments) {
+        const std::string normalized_segment = whisper_normalize_repeat_text(segment.text);
+        if (normalized_segment.size() < WHISPER_REPEAT_MIN_PATTERN_CHARS) {
+            previous_segment_text.clear();
+            repeated_segment_count = 0;
+            repeated_segment_duration = 0;
+            continue;
+        }
+
+        const int64_t segment_duration = std::max<int64_t>(0, segment.t1 - segment.t0);
+        if (!previous_segment_text.empty() && normalized_segment == previous_segment_text) {
+            ++repeated_segment_count;
+            repeated_segment_duration += segment_duration;
+        } else {
+            previous_segment_text = normalized_segment;
+            repeated_segment_count = 1;
+            repeated_segment_duration = segment_duration;
+        }
+
+        if (repeated_segment_count >= WHISPER_REPEAT_MIN_COUNT &&
+            repeated_segment_duration >= WHISPER_REPEAT_MIN_DURATION_CS) {
+            if (reason) {
+                *reason = "repeated consecutive segments";
+            }
+            return true;
+        }
+    }
+
+    const std::string normalized_text = whisper_normalize_repeat_text(candidate.text);
+    if (normalized_text.size() >= WHISPER_REPEAT_MIN_TEXT_CHARS &&
+        chunk_duration >= WHISPER_REPEAT_MIN_DURATION_CS &&
+        whisper_has_repeated_suffix(normalized_text)) {
+        if (reason) {
+            *reason = "repeated chunk suffix";
+        }
+        return true;
+    }
+
+    const std::string recent_tail = whisper_normalize_repeat_text(whisper_collect_recent_text_tail(state.result_all));
+    if (normalized_text.size() >= WHISPER_REPEAT_MIN_TEXT_CHARS &&
+        chunk_duration >= WHISPER_REPEAT_MIN_DURATION_CS &&
+        recent_tail.size() >= normalized_text.size() &&
+        recent_tail.compare(recent_tail.size() - normalized_text.size(), normalized_text.size(), normalized_text) == 0) {
+        if (reason) {
+            *reason = "chunk matches recent committed tail";
+        }
+        return true;
+    }
+
+    return false;
+}
+
+static whisper_chunk_candidate whisper_build_chunk_candidate(
+        struct whisper_context * ctx,
+        struct whisper_state * state,
+        const struct whisper_full_params & params,
+        const std::vector<whisper_token> & prompt,
+        const std::vector<whisper_token> & prompt_init,
+        int seek,
+        int seek_delta,
+        bool has_loaded_model,
+        const whisper_decoder & best_decoder) {
+    whisper_chunk_candidate candidate;
+
+    candidate.seek_delta = seek_delta;
+    candidate.is_no_speech = (state->no_speech_prob > params.no_speech_thold &&
+            best_decoder.sequence.avg_logprobs < params.logprob_thold);
+
+    if (!params.carry_initial_prompt &&
+        !prompt.empty() &&
+        prompt.front() == whisper_token_prev(ctx) &&
+        prompt.size() >= prompt_init.size()) {
+        candidate.prompt_past1_next.insert(candidate.prompt_past1_next.end(),
+                prompt.begin() + 1,
+                prompt.end() - prompt_init.size());
+    }
+
+    const auto & tokens_cur = best_decoder.sequence.tokens;
+    const int result_len = best_decoder.sequence.result_len;
+
+    if (!candidate.is_no_speech) {
+        for (int i = 0; i < result_len; ++i) {
+            candidate.prompt_past1_next.push_back(tokens_cur[i].id);
+        }
+    }
+
+    if (!tokens_cur.empty() && has_loaded_model && !candidate.is_no_speech) {
+        int  i0 = 0;
+        auto t0 = seek + 2*(tokens_cur.front().tid - whisper_token_beg(ctx));
+
+        std::string text;
+        bool speaker_turn_next = false;
+
+        for (int i = 0; i < (int) tokens_cur.size(); ++i) {
+            if (params.print_special || tokens_cur[i].id < whisper_token_eot(ctx)) {
+                text += whisper_token_to_str(ctx, tokens_cur[i].id);
+            }
+
+            if (params.tdrz_enable && tokens_cur[i].id == whisper_token_solm(ctx)) {
+                speaker_turn_next = true;
+            }
+
+            if (tokens_cur[i].id > whisper_token_beg(ctx) && !params.single_segment) {
+                const auto t1 = seek + 2*(tokens_cur[i].tid - whisper_token_beg(ctx));
+
+                if (!text.empty()) {
+                    whisper_segment segment = {
+                        t0,
+                        t1,
+                        text,
+                        state->no_speech_prob,
+                        {},
+                        speaker_turn_next,
+                    };
+
+                    for (int j = i0; j <= i; ++j) {
+                        segment.tokens.push_back(tokens_cur[j]);
+                    }
+
+                    candidate.text += segment.text;
+                    candidate.segments.push_back(std::move(segment));
+                }
+
+                text.clear();
+                while (i < (int) tokens_cur.size() && tokens_cur[i].id > whisper_token_beg(ctx)) {
+                    ++i;
+                }
+                --i;
+                t0 = t1;
+                i0 = i + 1;
+                speaker_turn_next = false;
+            }
+        }
+
+        if (!text.empty()) {
+            whisper_segment segment = {
+                t0,
+                seek + seek_delta,
+                text,
+                state->no_speech_prob,
+                {},
+                speaker_turn_next,
+            };
+
+            for (int j = i0; j < (int) tokens_cur.size(); ++j) {
+                segment.tokens.push_back(tokens_cur[j]);
+            }
+
+            candidate.text += segment.text;
+            candidate.segments.push_back(std::move(segment));
+        }
+    }
+
+    candidate.single_timestamp_ending = tokens_cur.size() > 1 &&
+            tokens_cur[tokens_cur.size() - 2].id < whisper_token_beg(ctx) &&
+            tokens_cur[tokens_cur.size() - 1].id > whisper_token_beg(ctx);
+
+    return candidate;
+}
 
 struct whisper_context {
     int64_t t_load_us  = 0;
@@ -5989,6 +6326,8 @@ struct whisper_full_params whisper_full_default_params(enum whisper_sampling_str
         /*.vad_model_path              =*/ nullptr,
 
         /* vad_params =*/ whisper_vad_default_params(),
+        /*.context_max_vad_gap_ms      =*/ WHISPER_CONTEXT_GAP_DISABLE,
+        /*.retry_on_repeat             =*/ false,
     };
 
     switch (strategy) {
@@ -6625,6 +6964,7 @@ static bool whisper_vad(
                    const float * samples,
                            int   n_samples,
             std::vector<float> & filtered_samples) {
+    (void) ctx;
     WHISPER_LOG_INFO("%s: VAD is enabled, processing speech segments only\n", __func__);
     int filtered_n_samples = 0;
 
@@ -6653,8 +6993,8 @@ static bool whisper_vad(
 
     if (vad_segments->data.size() > 0) {
         state->has_vad_segments = true;
-        ctx->state->vad_segments.clear();
-        ctx->state->vad_segments.reserve(vad_segments->data.size());
+        state->vad_segments.clear();
+        state->vad_segments.reserve(vad_segments->data.size());
 
         // Initialize the time mapping table
         state->vad_mapping_table.clear();
@@ -6727,7 +7067,7 @@ static bool whisper_vad(
 
                 WHISPER_LOG_INFO("%s: vad_segment_info: orig_start: %.2f, orig_end: %.2f, vad_start: %.2f, vad_end: %.2f\n",
                     __func__, segment.orig_start/100.0, segment.orig_end/100.0, segment.vad_start/100.0, segment.vad_end/100.0);
-                ctx->state->vad_segments.push_back(segment);
+                state->vad_segments.push_back(segment);
 
                 // Copy this speech segment
                 memcpy(filtered_samples.data() + offset, samples + segment_start_samples, segment_length * sizeof(float));
@@ -6985,6 +7325,7 @@ int whisper_full_with_state(
 
     std::vector<std::vector<beam_candidate>> bc_per_dec(n_decoders);
     std::vector<beam_candidate> beam_candidates;
+    int repeat_retry_seek = -1;
 
     // main loop
     while (true) {
@@ -7018,6 +7359,24 @@ int whisper_full_with_state(
         if (seek > seek_start && seek + 500 >= seek_end) {
             prompt_past0.clear();
             prompt_past1.clear();
+        }
+
+        int64_t context_gap_ms = -1;
+        int context_segment_index = -1;
+        const bool allow_dynamic_context = whisper_allow_dynamic_context(
+                *state,
+                params,
+                seek,
+                &context_gap_ms,
+                &context_segment_index);
+
+        if (!allow_dynamic_context && !prompt_past1.empty()) {
+            WHISPER_LOG_DEBUG(
+                    "%s: disabling dynamic context at seek %d due to VAD gap of %lld ms before segment %d\n",
+                    __func__,
+                    seek,
+                    (long long) context_gap_ms,
+                    context_segment_index);
         }
 
         int best_decoder_id = 0;
@@ -7080,7 +7439,7 @@ int whisper_full_with_state(
 
                 if (params.n_max_text_ctx > 0 && t_cur < WHISPER_HISTORY_CONDITIONING_TEMP_CUTOFF) {
                     const bool can_take0 = params.carry_initial_prompt && !prompt_past0.empty();
-                    const bool can_take1 = !prompt_past1.empty();
+                    const bool can_take1 = allow_dynamic_context && !prompt_past1.empty();
 
                     if (max_prompt_ctx > 0 && (can_take0 || can_take1)) {
                         // Always start with previous token marker to connect continuity
@@ -7565,134 +7924,66 @@ int whisper_full_with_state(
         {
             const auto & best_decoder = state->decoders[best_decoder_id];
 
-            auto seek_delta = best_decoder.seek_delta;
-            const auto result_len = best_decoder.sequence.result_len;
+            whisper_chunk_candidate candidate = whisper_build_chunk_candidate(
+                    ctx,
+                    state,
+                    params,
+                    prompt,
+                    prompt_init,
+                    seek,
+                    best_decoder.seek_delta,
+                    ctx->model.n_loaded > 0,
+                    best_decoder);
 
-            const auto & tokens_cur = best_decoder.sequence.tokens;
+            if (params.retry_on_repeat && repeat_retry_seek != seek) {
+                std::string repeat_reason;
+                if (whisper_detect_repeat_in_candidate(*state, candidate, &repeat_reason)) {
+                    WHISPER_LOG_INFO(
+                            "%s: repetition detected at seek %d (%s), retrying once without dynamic context\n",
+                            __func__,
+                            seek,
+                            repeat_reason.c_str());
 
-            // [EXPERIMENTAL] Token-level timestamps with DTW
+                    prompt_past1.clear();
+                    repeat_retry_seek = seek;
+                    continue;
+                }
+            }
+
+            repeat_retry_seek = -1;
+
+            auto seek_delta = candidate.seek_delta;
             const auto n_segments_before = state->result_all.size();
 
-            const bool is_no_speech = (state->no_speech_prob > params.no_speech_thold &&
-                best_decoder.sequence.avg_logprobs < params.logprob_thold);
+            prompt_past1 = std::move(candidate.prompt_past1_next);
 
-            //WHISPER_LOG_DEBUG("prompt_init.size() = %d, prompt.size() = %d, result_len = %d, seek_delta = %d\n", prompt_init.size(), prompt.size(), result_len, seek_delta);
-
-            // update prompt_past1
-            prompt_past1.clear();
-            if (!params.carry_initial_prompt && !prompt.empty() && prompt.front() == whisper_token_prev(ctx)) {
-                prompt_past1.insert(prompt_past1.end(), prompt.begin() + 1, prompt.end() - prompt_init.size());
-            }
-
-            // Add newly decoded tokens to the rolling context
-            if (!is_no_speech) {
-                for (int i = 0; i < result_len; ++i) {
-                    prompt_past1.push_back(tokens_cur[i].id);
-                }
-            }
-
-            if (!tokens_cur.empty() && ctx->model.n_loaded > 0 && !is_no_speech) {
-                int  i0 = 0;
-                auto t0 = seek + 2*(tokens_cur.front().tid - whisper_token_beg(ctx));
-
-                std::string text;
-                bool speaker_turn_next = false;
-
-                for (int i = 0; i < (int) tokens_cur.size(); i++) {
-                    //printf("%s: %18s %6.3f %18s %6.3f\n", __func__,
-                    //        ctx->vocab.id_to_token[tokens_cur[i].id].c_str(), tokens_cur[i].p,
-                    //        ctx->vocab.id_to_token[tokens_cur[i].tid].c_str(), tokens_cur[i].pt);
-
-                    if (params.print_special || tokens_cur[i].id < whisper_token_eot(ctx)) {
-                        text += whisper_token_to_str(ctx, tokens_cur[i].id);
-                    }
-
-                    // [TDRZ] record if speaker turn was predicted after current segment
-                    if (params.tdrz_enable && tokens_cur[i].id == whisper_token_solm(ctx)) {
-                        speaker_turn_next = true;
-                    }
-
-                    if (tokens_cur[i].id > whisper_token_beg(ctx) && !params.single_segment) {
-                        const auto t1 = seek + 2*(tokens_cur[i].tid - whisper_token_beg(ctx));
-
-                        if (!text.empty()) {
-                            const auto tt0 = t0;
-                            const auto tt1 = t1;
-
-                            if (params.print_realtime) {
-                                if (params.print_timestamps) {
-                                    printf("[%s --> %s]  %s\n", to_timestamp(tt0).c_str(), to_timestamp(tt1).c_str(), text.c_str());
-                                } else {
-                                    printf("%s", text.c_str());
-                                    fflush(stdout);
-                                }
-                            }
-
-                            //printf("tt0 = %d, tt1 = %d, text = %s, token = %s, token_id = %d, tid = %d\n", tt0, tt1, text.c_str(), ctx->vocab.id_to_token[tokens_cur[i].id].c_str(), tokens_cur[i].id, tokens_cur[i].tid);
-
-                            result_all.push_back({ tt0, tt1, text, state->no_speech_prob, {}, speaker_turn_next });
-                            for (int j = i0; j <= i; j++) {
-                                result_all.back().tokens.push_back(tokens_cur[j]);
-                            }
-
-                            int n_new = 1;
-
-                            if (params.token_timestamps) {
-                                whisper_exp_compute_token_level_timestamps(
-                                        *ctx, *state, result_all.size() - 1, params.thold_pt, params.thold_ptsum);
-
-                                if (params.max_len > 0) {
-                                    n_new = whisper_wrap_segment(*ctx, *state, params.max_len, params.split_on_word);
-                                }
-                            }
-                            if (params.new_segment_callback && !ctx->params.dtw_token_timestamps) {
-                                params.new_segment_callback(ctx, state, n_new, params.new_segment_callback_user_data);
-                            }
-                        }
-                        text = "";
-                        while (i < (int) tokens_cur.size() && tokens_cur[i].id > whisper_token_beg(ctx)) {
-                            i++;
-                        }
-                        i--;
-                        t0 = t1;
-                        i0 = i + 1;
-                        speaker_turn_next = false;
+            for (auto & segment : candidate.segments) {
+                if (params.print_realtime) {
+                    if (params.print_timestamps) {
+                        printf("[%s --> %s]  %s\n",
+                                to_timestamp(segment.t0).c_str(),
+                                to_timestamp(segment.t1).c_str(),
+                                segment.text.c_str());
+                    } else {
+                        printf("%s", segment.text.c_str());
+                        fflush(stdout);
                     }
                 }
 
-                if (!text.empty()) {
-                    const auto t1 = seek + seek_delta;
+                result_all.push_back(std::move(segment));
 
-                    const auto tt0 = t0;
-                    const auto tt1 = t1;
+                int n_new = 1;
 
-                    if (params.print_realtime) {
-                        if (params.print_timestamps) {
-                            printf("[%s --> %s]  %s\n", to_timestamp(tt0).c_str(), to_timestamp(tt1).c_str(), text.c_str());
-                        } else {
-                            printf("%s", text.c_str());
-                            fflush(stdout);
-                        }
+                if (params.token_timestamps) {
+                    whisper_exp_compute_token_level_timestamps(
+                            *ctx, *state, result_all.size() - 1, params.thold_pt, params.thold_ptsum);
+
+                    if (params.max_len > 0) {
+                        n_new = whisper_wrap_segment(*ctx, *state, params.max_len, params.split_on_word);
                     }
-
-                    result_all.push_back({ tt0, tt1, text, state->no_speech_prob, {}, speaker_turn_next });
-                    for (int j = i0; j < (int) tokens_cur.size(); j++) {
-                        result_all.back().tokens.push_back(tokens_cur[j]);
-                    }
-
-                    int n_new = 1;
-
-                    if (params.token_timestamps) {
-                        whisper_exp_compute_token_level_timestamps(
-                                *ctx, *state, result_all.size() - 1, params.thold_pt, params.thold_ptsum);
-
-                        if (params.max_len > 0) {
-                            n_new = whisper_wrap_segment(*ctx, *state, params.max_len, params.split_on_word);
-                        }
-                    }
-                    if (params.new_segment_callback && !ctx->params.dtw_token_timestamps) {
-                        params.new_segment_callback(ctx, state, n_new, params.new_segment_callback_user_data);
-                    }
+                }
+                if (params.new_segment_callback && !ctx->params.dtw_token_timestamps) {
+                    params.new_segment_callback(ctx, state, n_new, params.new_segment_callback_user_data);
                 }
             }
 
@@ -7713,10 +8004,7 @@ int whisper_full_with_state(
             }
 
             // ref: https://github.com/ggml-org/whisper.cpp/pull/2629
-            const bool single_timestamp_ending = tokens_cur.size() > 1 &&
-                tokens_cur[tokens_cur.size() - 2].id < whisper_token_beg(ctx) &&
-                tokens_cur[tokens_cur.size() - 1].id > whisper_token_beg(ctx);
-            if (single_timestamp_ending) {
+            if (candidate.single_timestamp_ending) {
                 WHISPER_LOG_DEBUG("single timestamp ending - skip entire chunk\n");
                 seek_delta = std::min(seek_end - seek, WHISPER_CHUNK_SIZE * 100);
             }
@@ -7793,6 +8081,9 @@ int whisper_full_parallel(
     for (int i = 0; i < n_processors - 1; ++i) {
         // create a new state for each thread
         states.push_back(whisper_init_state(ctx));
+        states.back()->vad_segments = ctx->state->vad_segments;
+        states.back()->has_vad_segments = ctx->state->has_vad_segments;
+        states.back()->vad_mapping_table = ctx->state->vad_mapping_table;
 
         const int start_samples = offset_samples + (i + 1)*n_samples_per_processor;
         const int n_samples_cur = (i == n_processors - 2) ? n_samples - start_samples : n_samples_per_processor;

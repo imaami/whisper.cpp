@@ -588,6 +588,9 @@ extern "C" {
         const char * vad_model_path;              // Path to VAD model
 
         whisper_vad_params vad_params;
+
+        int  context_max_vad_gap_ms; // < 0 disables VAD gap gating for dynamic text context
+        bool retry_on_repeat;        // retry a chunk once without dynamic context when repetition is detected
     };
 
     // NOTE: this function allocates memory, and it is the responsibility of the caller to free the pointer - see whisper_free_context_params & whisper_free_params()

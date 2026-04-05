@@ -50,6 +50,8 @@ class WhisperCppTest {
         assertEquals(0.01f, params.thold_pt);
         assertEquals(5, params.beam_search.beam_size);
         assertEquals(-1.0f, params.beam_search.patience);
+        assertEquals(-1, params.context_max_vad_gap_ms);
+        assertFalse(params.retry_on_repeat);
     }
 
     @Test
@@ -62,6 +64,8 @@ class WhisperCppTest {
         assertNotEquals(0, params.n_threads);
         assertEquals(16384, params.n_max_text_ctx);
         assertEquals(5, params.greedy.best_of);
+        assertEquals(-1, params.context_max_vad_gap_ms);
+        assertFalse(params.retry_on_repeat);
     }
 
     @Test

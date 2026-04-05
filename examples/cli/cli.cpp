@@ -80,6 +80,8 @@ struct whisper_params {
     int32_t gpu_device   = 0;
     bool suppress_nst    = false;
     bool carry_initial_prompt = false;
+    bool retry_on_repeat = false;
+    int32_t context_max_vad_gap_ms = -1;
 
     std::string language  = "en";
     std::string prompt;
@@ -194,6 +196,8 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-dl"   || arg == "--detect-language")      { params.detect_language = true; }
         else if (                  arg == "--prompt")               { params.prompt          = ARGV_NEXT; }
         else if (                  arg == "--carry-initial-prompt") { params.carry_initial_prompt = true; }
+        else if (                  arg == "--retry-on-repeat")      { params.retry_on_repeat = true; }
+        else if (                  arg == "--context-max-vad-gap-ms") { params.context_max_vad_gap_ms = std::stoi(ARGV_NEXT); }
         else if (arg == "-m"    || arg == "--model")                { params.model           = ARGV_NEXT; }
         else if (arg == "-f"    || arg == "--file")                 { params.fname_inp.emplace_back(ARGV_NEXT); }
         else if (arg == "-oved" || arg == "--ov-e-device")          { params.openvino_encode_device = ARGV_NEXT; }
@@ -276,6 +280,7 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
     fprintf(stderr, "  -dl,       --detect-language      [%-7s] exit after automatically detecting language\n",    params.detect_language ? "true" : "false");
     fprintf(stderr, "             --prompt PROMPT        [%-7s] initial prompt (max n_text_ctx/2 tokens)\n",       params.prompt.c_str());
     fprintf(stderr, "             --carry-initial-prompt [%-7s] always prepend initial prompt\n",                  params.carry_initial_prompt ? "true" : "false");
+    fprintf(stderr, "             --retry-on-repeat      [%-7s] retry one chunk once without dynamic context when repetition is detected\n", params.retry_on_repeat ? "true" : "false");
     fprintf(stderr, "  -m FNAME,  --model FNAME          [%-7s] model path\n",                                     params.model.c_str());
     fprintf(stderr, "  -f FNAME,  --file FNAME           [%-7s] input audio file path\n",                          "");
     fprintf(stderr, "  -oved D,   --ov-e-device DNAME    [%-7s] the OpenVINO device used for encode inference\n",  params.openvino_encode_device.c_str());
@@ -302,6 +307,7 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
                                                                                                                                   std::to_string(params.vad_max_speech_duration_s).c_str());
     fprintf(stderr, "  -vp N,     --vad-speech-pad-ms           N [%-7d] VAD speech padding (extend segments)\n",             params.vad_speech_pad_ms);
     fprintf(stderr, "  -vo N,     --vad-samples-overlap         N [%-7.2f] VAD samples overlap (seconds between segments)\n", params.vad_samples_overlap);
+    fprintf(stderr, "             --context-max-vad-gap-ms N    [%-7d] carry dynamic context only when the original VAD silence gap is within N ms (-1 disables, 0 always breaks across islands)\n", params.context_max_vad_gap_ms);
     fprintf(stderr, "\n");
 }
 
@@ -1220,6 +1226,8 @@ int main(int argc, char ** argv) {
             wparams.vad_params.max_speech_duration_s   = params.vad_max_speech_duration_s;
             wparams.vad_params.speech_pad_ms           = params.vad_speech_pad_ms;
             wparams.vad_params.samples_overlap         = params.vad_samples_overlap;
+            wparams.context_max_vad_gap_ms            = params.context_max_vad_gap_ms;
+            wparams.retry_on_repeat                   = params.retry_on_repeat;
 
             whisper_print_user_data user_data = { &params, &pcmf32s, 0 };
 
