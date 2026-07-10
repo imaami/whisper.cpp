@@ -1,9 +1,10 @@
 name: context-window-resolve-and-build
 
 on:
-  push:
+  pull_request:
     branches:
       - master
+    types: [opened, reopened, synchronize]
 
 permissions:
   contents: write
@@ -21,114 +22,12 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("src/whisper.cpp")
-          text = path.read_text()
-
-          anchor = "            prompt_past1 = std::move(candidate.prompt_past1_next);\n\n"
-          anchor_pos = text.index(anchor)
-          start = text.index("<<<<<<< HEAD", anchor_pos)
-          end_marker = "            // FIXME: will timestamp offsets be correct?"
-          end = text.index(end_marker, start)
-
-          candidate_commit = '''            for (auto & segment : candidate.segments) {
-              if (params.print_realtime) {
-                  if (params.print_timestamps) {
-                      printf("[%s --> %s]  %s\\n",
-                              to_timestamp(segment.t0).c_str(),
-                              to_timestamp(segment.t1).c_str(),
-                              segment.text.c_str());
-                  } else {
-                      printf("%s", segment.text.c_str());
-                  }
-                  fflush(stdout);
-              }
-
-              result_all.push_back(std::move(segment));
-
-              int n_new = 1;
-
-              if (params.token_timestamps) {
-                  whisper_exp_compute_token_level_timestamps(
-                          *ctx, *state, result_all.size() - 1, params.thold_pt, params.thold_ptsum);
-
-                  if (params.max_len > 0) {
-                      n_new = whisper_wrap_segment(*ctx, *state, params.max_len, params.split_on_word);
-                  }
-              }
-              if (params.new_segment_callback && !ctx->params.dtw_token_timestamps) {
-                  params.new_segment_callback(ctx, state, n_new, params.new_segment_callback_user_data);
-              }
-          }
-
-'''
-          text = text[:start] + candidate_commit + text[end:]
-
-          ref_anchor = "            // ref: https://github.com/ggml-org/whisper.cpp/pull/2629"
-          ref_pos = text.index(ref_anchor, anchor_pos)
-          start = text.index("<<<<<<< HEAD", ref_pos)
-          marker = ">>>>>>> origin/context-window"
-          end = text.index(marker, start) + len(marker)
-          if end < len(text) and text[end] == "\n":
-              end += 1
-          text = text[:start] + "            if (candidate.single_timestamp_ending) {\n" + text[end:]
-
-          old_timestamp_run = '''                text.clear();
-              while (i < (int) tokens_cur.size() && tokens_cur[i].id > whisper_token_beg(ctx)) {
-                  ++i;
-              }
-              --i;
-              t0 = t1;
-              i0 = i + 1;
-              speaker_turn_next = false;
-'''
-          new_timestamp_run = '''                text.clear();
-              t0 = t1;
-              while (i + 1 < (int) tokens_cur.size() &&
-                     tokens_cur[i + 1].id > whisper_token_beg(ctx)) {
-                  ++i;
-                  if (params.print_special) {
-                      text += whisper_token_to_str(ctx, tokens_cur[i].id);
-                  }
-                  t0 = seek + 2*(tokens_cur[i].tid - whisper_token_beg(ctx));
-              }
-              i0 = i + 1;
-              speaker_turn_next = false;
-'''
-          if text.count(old_timestamp_run) != 1:
-              raise RuntimeError("unexpected timestamp-run helper shape")
-          text = text.replace(old_timestamp_run, new_timestamp_run, 1)
-
-          old_single_ts = '''    candidate.single_timestamp_ending = tokens_cur.size() > 1 &&
-            tokens_cur[tokens_cur.size() - 2].id < whisper_token_beg(ctx) &&
-            tokens_cur[tokens_cur.size() - 1].id > whisper_token_beg(ctx);
-'''
-          new_single_ts = '''    const bool max_tokens_timestamp_ending = params.max_tokens > 0 &&
-          !params.single_segment &&
-          tokens_cur.size() > (size_t) params.max_tokens;
-
-  candidate.single_timestamp_ending = tokens_cur.size() > 1 &&
-          !max_tokens_timestamp_ending &&
-          tokens_cur[tokens_cur.size() - 2].id < whisper_token_beg(ctx) &&
-          tokens_cur[tokens_cur.size() - 1].id > whisper_token_beg(ctx);
-'''
-          if text.count(old_single_ts) != 1:
-              raise RuntimeError("unexpected single-timestamp helper shape")
-          text = text.replace(old_single_ts, new_single_ts, 1)
-
-          for marker in ("<<<<<<<", "=======", ">>>>>>>"):
-              if marker in text:
-                  raise RuntimeError(f"unresolved conflict marker: {marker}")
-
-          path.write_text(text)
-          PY
-
+          python3 .github/scripts/resolve-context-window.py
           rm -f MERGE_CONFLICTS.txt \
             .github/workflows/context-window-export.yml \
-            .github/workflows/context-window-resolve.yml
+            .github/scripts/resolve-context-window.py
           git diff --check
+          ! grep -R -n -E '^(<<<<<<<|=======|>>>>>>>)' -- src
 
       - name: Configure and build
         shell: bash
@@ -149,6 +48,8 @@ jobs:
           git fetch origin master context-window
           git add -A
           git reset --soft origin/master
+          git restore --staged .github/workflows/context-window-resolve.yml || true
+          git restore .github/workflows/context-window-resolve.yml || true
           git commit -m "Implement VAD-gated context carry and repeat retry" \
             -m "Add context_max_vad_gap_ms and retry_on_repeat to whisper_full_params and expose them through the CLI and language bindings." \
             -m "Gate dynamic prompt history on original VAD segment gaps, detect repeated chunk output before commit, and retry the chunk once without dynamic context when needed."
