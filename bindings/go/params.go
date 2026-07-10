@@ -183,6 +183,14 @@ func (p *Params) SetCarryInitialPrompt(v bool) {
 	p.carry_initial_prompt = toBool(v)
 }
 
+func (p *Params) SetContextMaxVADGapMs(ms int) {
+	p.context_max_vad_gap_ms = C.int(ms)
+}
+
+func (p *Params) SetRetryOnRepeat(v bool) {
+	p.retry_on_repeat = toBool(v)
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // PRIVATE METHODS
 
@@ -238,6 +246,12 @@ func (p *Params) String() string {
 	}
 	if p.carry_initial_prompt {
 		str += " carry_initial_prompt"
+	}
+	if p.context_max_vad_gap_ms >= 0 {
+		str += fmt.Sprintf(" context_max_vad_gap_ms=%d", p.context_max_vad_gap_ms)
+	}
+	if p.retry_on_repeat {
+		str += " retry_on_repeat"
 	}
 
 	return str + ">"
