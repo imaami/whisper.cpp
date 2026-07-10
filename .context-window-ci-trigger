@@ -1,3 +1,4 @@
 Trigger the temporary context-window resolver workflow.
 Retry: anchored conflict-marker validation.
 Cleanup: reparent verified tree directly onto upstream master.
+Finalize: remove temporary workflow and squash the verified tree.
