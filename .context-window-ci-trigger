@@ -1,1 +1,2 @@
 Trigger the temporary context-window resolver workflow.
+Retry: anchored conflict-marker validation.
