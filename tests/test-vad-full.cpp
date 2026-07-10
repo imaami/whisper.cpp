@@ -36,6 +36,8 @@ int main() {
     wparams.vad_params.min_silence_duration_ms = 100;
     wparams.vad_params.max_speech_duration_s   = FLT_MAX;
     wparams.vad_params.speech_pad_ms           = 30;
+    wparams.context_max_vad_gap_ms             = 0;
+    wparams.retry_on_repeat                    = true;
 
     assert(whisper_full_parallel(wctx, wparams, pcmf32.data(), pcmf32.size(), 1) == 0);
 

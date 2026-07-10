@@ -331,6 +331,20 @@ public class WhisperFullParams extends Structure {
     public long i_start_rule;
     public float grammar_penalty;
 
+    /** Carry dynamic context only when the original VAD silence gap is within this threshold. */
+    public int context_max_vad_gap_ms;
+
+    /** Retry a chunk once without dynamic context when repetition is detected. */
+    public CBool retry_on_repeat;
+
+    public void setContextMaxVadGapMs(int gapMs) {
+        context_max_vad_gap_ms = gapMs;
+    }
+
+    public void retryOnRepeat(boolean enable) {
+        retry_on_repeat = enable ? CBool.TRUE : CBool.FALSE;
+    }
+
     @Override
     protected List<String> getFieldOrder() {
         return Arrays.asList("strategy", "n_threads", "n_max_text_ctx",
@@ -349,7 +363,8 @@ public class WhisperFullParams extends Structure {
                 "encoder_begin_callback", "encoder_begin_callback_user_data",
                 "abort_callback", "abort_callback_user_data",
                 "logits_filter_callback", "logits_filter_callback_user_data",
-                "grammar_rules", "n_grammar_rules", "i_start_rule", "grammar_penalty");
+                "grammar_rules", "n_grammar_rules", "i_start_rule", "grammar_penalty",
+                "context_max_vad_gap_ms", "retry_on_repeat");
     }
 
     public static class ByValue extends WhisperFullParams implements Structure.ByValue {
